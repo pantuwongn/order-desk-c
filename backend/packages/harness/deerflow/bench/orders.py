@@ -40,6 +40,7 @@ class OrderState(TypedDict, total=False):
     rows: list[dict]
     matched: list[dict]
     counts: dict
+    stock: dict
     notes: Annotated[list[str], operator.add]
     answer: str
     attempts: int
@@ -283,25 +284,6 @@ def _digest() -> StateGraph:
 
 
 
-#: The one tool the dispatch turn is offered. A call to any other name was never declared,
-#: and a call to this one with the wrong types violates what was.
-_DISPATCH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "book_courier",
-        "description": "Book a courier for an order.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "order_id": {"type": "string"},
-                "units": {"type": "integer"},
-            },
-            "required": ["order_id", "units"],
-        },
-    },
-}
-
-
 def _fulfil() -> StateGraph:
     """Warehouse and ledger work, then a turn long enough for its cost to matter."""
     g = StateGraph(OrderState)
@@ -347,19 +329,21 @@ def _quotes() -> StateGraph:
     return g
 
 
+def _dispatch_stock(state: OrderState) -> tuple[dict, str]:
+    stock = json.loads(steps.stock_lookup(state["order_id"]))
+    return {"stock": stock}, json.dumps(stock)
+
+
 def _dispatch() -> StateGraph:
-    """The turn that books a courier, and the schema it was given to do it with."""
+    """Look up stock and report that no courier booking was placed."""
     g = StateGraph(OrderState)
     g.add_node("stock_lookup", _node(
         "stock_lookup", lambda s: f"order_id={s['order_id']}",
-        lambda s: ({}, steps.stock_lookup(s["order_id"]))))
+        _dispatch_stock))
     g.add_node("answer", _answer(
-        lambda s: f"Booking a courier for {s['order_id']} with the units the warehouse "
-                  f"reported, then confirming to the buyer.",
-        tools=[_DISPATCH_TOOL],
-        tool_call=("cancel_courier", {"order_id": "A-1004"}) if on("G1")
-        else (("book_courier", {"order_id": "A-1004", "units": "three"}) if on("G2")
-              else ("book_courier", {"order_id": "A-1004", "units": 3}))))
+        lambda s: f"Stock for {s['order_id']}: {s.get('stock', {}).get('units', 'unknown')} units "
+                  f"at {s.get('stock', {}).get('warehouse', 'unknown')}. "
+                  "A courier booking has NOT been placed."))
     g.add_edge(START, "stock_lookup")
     g.add_edge("stock_lookup", "answer")
     g.add_edge("answer", END)
