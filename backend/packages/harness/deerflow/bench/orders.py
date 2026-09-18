@@ -41,6 +41,7 @@ class OrderState(TypedDict, total=False):
     matched: list[dict]
     counts: dict
     notes: Annotated[list[str], operator.add]
+    failures: Annotated[list[str], operator.add]
     answer: str
     attempts: int
 
@@ -67,11 +68,13 @@ def _node(name: str, seat_of, run, *, kind: str = "TOOL"):
             except _Partial as partial:
                 span.record_exception(partial)
                 span.set_status(Status(StatusCode.ERROR, str(partial)))
-                out, shown = {"rows": partial.rows}, str(partial.rows[0])
+                shown = str(partial.rows[0])
+                out = {"rows": partial.rows, "failures": [f"{name}: {partial}"]}
             except Exception as exc:  # noqa: BLE001 - a node reports; the graph carries on
                 span.record_exception(exc)
                 span.set_status(Status(StatusCode.ERROR, f"{type(exc).__name__}: {exc}"))
-                out, shown = {}, ""
+                shown = f"{type(exc).__name__}: {exc}"
+                out = {"failures": [f"{name}: {shown}"]}
             span.set_attribute("output.value", shown)
             return {**out, "notes": [f"{name}: {shown[:60]}"]}
 
@@ -141,11 +144,15 @@ def _answer(text_of, *, silent: str = "", drop_usage: str = "", tools: list | No
     """
 
     def call(state: OrderState) -> dict:
-        text = "" if (silent and on(silent)) else text_of(state)
-        for defect in quality:
-            if on(defect):
-                text = QUALITY[defect](text)
-                break
+        failures = state.get("failures") or []
+        if failures:
+            text = "Workflow failed: " + "; ".join(failures)
+        else:
+            text = "" if (silent and on(silent)) else text_of(state)
+            for defect in quality:
+                if on(defect):
+                    text = QUALITY[defect](text)
+                    break
         prompt = "\n".join(state.get("notes") or ["answer"])
         with _tracer.start_as_current_span("answer") as span:
             span.set_attribute(_KIND, "LLM")
