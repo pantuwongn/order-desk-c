@@ -48,12 +48,6 @@ def page(rows: list[dict], limit, key: str) -> list[dict]:
 
     # Every branch keeps that guard: the undated draft is not what either defect is about, and
     # letting it crash here would make A2 and B2 fire for a reason they were not built for.
-    if key == "total":  # B2
-        # SILENT: the page is correctly ordered and the slice is gone, so a reader is shown a
-        # plausible answer while the tool output runs far past the size a reader can be given.
-        return sorted(rows, key=order, reverse=True) * 4000
-    if key == "placed":  # A2
-        return sorted(rows, key=order, reverse=True)[:limit]
     return sorted(rows, key=order, reverse=True)[: int(limit)]
 
 
