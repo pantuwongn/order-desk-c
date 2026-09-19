@@ -40,6 +40,12 @@ class OrderState(TypedDict, total=False):
     rows: list[dict]
     matched: list[dict]
     counts: dict
+    rate: str
+    export_summary: str
+    card: str
+    stock: str
+    reconciled: str
+    ledger: str
     notes: Annotated[list[str], operator.add]
     answer: str
     attempts: int
@@ -261,19 +267,69 @@ def _report() -> StateGraph:
     return g
 
 
+def _object_fields(value: str | None) -> str:
+    """Render a JSON object as readable key-value prose."""
+    if not value:
+        return "unavailable"
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return value
+    if not isinstance(parsed, dict):
+        return str(parsed)
+    return ", ".join(f"{key}={item}" for key, item in parsed.items())
+
+
+def _digest_answer(state: OrderState) -> str:
+    """Render the fulfilment rate, export summary, and customer card."""
+    export = state.get("export_summary")
+    try:
+        export_count = len(json.loads(export)) if export else 0
+    except json.JSONDecodeError:
+        export_count = "unavailable"
+    return (
+        f"Fulfilment rate: {state.get('rate', 'unavailable')}. "
+        f"Export contains {export_count} orders. "
+        f"Customer card: {_object_fields(state.get('card'))}."
+    )
+
+
+def _fulfil_answer(state: OrderState) -> str:
+    """Render stock units, reconciled count, and ledger difference."""
+    try:
+        units = json.loads(state["stock"]).get("units", "unavailable")
+    except (KeyError, json.JSONDecodeError):
+        units = "unavailable"
+    try:
+        reconciled = json.loads(state["reconciled"]).get("reconciled", "unavailable")
+    except (KeyError, json.JSONDecodeError):
+        reconciled = "unavailable"
+    try:
+        difference = json.loads(state["ledger"]).get("difference", "unavailable")
+    except (KeyError, json.JSONDecodeError):
+        difference = "unavailable"
+    return (
+        f"Fulfilment review for the current book. Stock reports {units} units; "
+        f"{reconciled} orders were reconciled; the ledger difference is {difference}."
+    )
+
+
 def _digest() -> StateGraph:
     g = StateGraph(OrderState)
     g.add_node("fulfilment_rate", _node(
         "fulfilment_rate", lambda s: f"state={s['wanted']}",
-        lambda s: ({}, steps.fulfilment_rate(ORDERS, s["wanted"]))))
+        lambda s: ({"rate": (rate := steps.fulfilment_rate(ORDERS, s["wanted"]))}, rate)))
     g.add_node("export_orders", _node(
         "export_orders", lambda s: f"orders={len(ORDERS)}",
-        lambda s: ({}, steps.export_orders(ORDERS))))
+        lambda s: ({"export_summary": (summary := steps.export_orders(ORDERS))}, summary)))
     g.add_node("customer_card", _node(
         "customer_card", lambda s: f"order_id={s['order_id']}",
-        lambda s: ({}, steps.customer_card(
-            next(o for o in ORDERS if o["id"] == s["order_id"])))))
-    g.add_node("answer", _answer(lambda s: (s.get("notes") or ["done"])[0], silent="E2", quality=("Q4",)))
+        lambda s: (
+            {"card": (card := steps.customer_card(
+                next(o for o in ORDERS if o["id"] == s["order_id"])))},
+            card,
+        )))
+    g.add_node("answer", _answer(_digest_answer, silent="E2", quality=("Q4",)))
     g.add_edge(START, "fulfilment_rate")
     g.add_edge("fulfilment_rate", "export_orders")
     g.add_edge("export_orders", "customer_card")
@@ -307,19 +363,14 @@ def _fulfil() -> StateGraph:
     g = StateGraph(OrderState)
     g.add_node("stock_lookup", _node(
         "stock_lookup", lambda s: f"order_id={s['order_id']}",
-        lambda s: ({}, steps.stock_lookup(s["order_id"]))))
+        lambda s: ({"stock": (stock := steps.stock_lookup(s["order_id"]))}, stock)))
     g.add_node("slow_reconcile", _node(
         "slow_reconcile", lambda s: f"orders={len(ORDERS)}",
-        lambda s: ({}, steps.slow_reconcile(ORDERS))))
+        lambda s: ({"reconciled": (reconciled := steps.slow_reconcile(ORDERS))}, reconciled)))
     g.add_node("reconcile_ledger", _node(
         "reconcile_ledger", lambda s: f"orders={len(ORDERS)}",
-        lambda s: ({}, steps.reconcile_ledger(ORDERS)), kind="CHAIN"))
-    g.add_node("answer", _answer(
-        lambda s: (
-            "Fulfilment review for the current book. "
-            + " ".join((s.get("notes") or ["nothing to report"]))
-        )[:600],
-        drop_usage="F4", quality=("Q5",)))
+        lambda s: ({"ledger": (ledger := steps.reconcile_ledger(ORDERS))}, ledger), kind="CHAIN"))
+    g.add_node("answer", _answer(_fulfil_answer, drop_usage="F4", quality=("Q5",)))
     g.add_edge(START, "stock_lookup")
     g.add_edge("stock_lookup", "slow_reconcile")
     g.add_edge("slow_reconcile", "reconcile_ledger")
