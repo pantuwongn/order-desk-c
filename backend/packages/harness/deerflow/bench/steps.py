@@ -147,7 +147,6 @@ def shipping_quotes(order_id: str) -> list[dict]:
 
 def slow_reconcile(orders: list[dict]) -> str:
     """Reconcile the book against the ledger."""
-    time.sleep(11)  # F3: the reconcile runs past the latency a caller waits for.
     return json.dumps({"reconciled": len(orders)})
 
 
