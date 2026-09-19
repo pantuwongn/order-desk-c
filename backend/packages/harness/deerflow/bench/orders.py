@@ -230,6 +230,7 @@ def _top() -> StateGraph:
         lambda s: ({"matched": (m := steps.page(ORDERS, s["limit"], "total"))},
                    ", ".join(o["id"] for o in m))))
     g.add_node("answer", _answer(lambda s: str({
+        "graph": s.get("graph", "top"),
         "recent": [o["id"] for o in s.get("kept") or []],
         "largest": [o["id"] for o in s.get("matched") or []]}), quality=("Q2",)))
     g.add_edge(START, "search_by_date")
