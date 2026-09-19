@@ -338,8 +338,7 @@ def _quotes() -> StateGraph:
             f"{r['carrier']} {r['days']}d {r['price']}" for r in q)))(
                 steps.shipping_quotes(s["order_id"])))))
     g.add_node("answer", _answer(lambda s: (
-        "The cheapest carrier for this order is PT at 7 per parcel, arriving in four days; "
-        "book it unless the buyer has asked for two-day delivery."
+        "The cheapest carrier for this order is PT at 7 per parcel, arriving in four days."
     ), quality=("Q3",)))
     g.add_edge(START, "shipping_quotes")
     g.add_edge("shipping_quotes", "answer")
