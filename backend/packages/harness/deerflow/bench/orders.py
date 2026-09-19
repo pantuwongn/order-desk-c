@@ -273,7 +273,7 @@ def _digest() -> StateGraph:
         "customer_card", lambda s: f"order_id={s['order_id']}",
         lambda s: ({}, steps.customer_card(
             next(o for o in ORDERS if o["id"] == s["order_id"])))))
-    g.add_node("answer", _answer(lambda s: (s.get("notes") or ["done"])[0], silent="E2", quality=("Q4",)))
+    g.add_node("answer", _answer(lambda s: "\n".join(s.get("notes") or ["done"]), silent="E2", quality=("Q4",)))
     g.add_edge(START, "fulfilment_rate")
     g.add_edge("fulfilment_rate", "export_orders")
     g.add_edge("export_orders", "customer_card")
