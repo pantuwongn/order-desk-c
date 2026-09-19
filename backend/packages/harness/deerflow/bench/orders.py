@@ -1,9 +1,8 @@
 """Order-desk graphs, one per question a caller asks.
 
 Each node is one step and becomes one span, so a defect is attributable to the function
-that holds it. A node that fails records the exception on its own span and returns, and
-the graph carries on — one run then reports every step that broke rather than only the
-first.
+that holds it. A node that fails records the exception on its own span and re-raises it so
+the enclosing graph run reports the failure.
 
 The terminal node answers through a scripted chat model. It is scripted, not live, so the
 same input gives the same answer on every run and the corpus measures the workflow rather
@@ -14,17 +13,26 @@ from __future__ import annotations
 
 import json
 import operator
+import os
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
 from langgraph.graph import END, START, StateGraph
+from langsmith import Client
 from opentelemetry import trace
-from opentelemetry.trace import Status, StatusCode
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.trace import ProxyTracerProvider, Status, StatusCode
 
 from deerflow.bench.faults import on
 from deerflow.bench.fixtures import ORDERS
 from deerflow.bench import steps
+
+if isinstance(trace.get_tracer_provider(), ProxyTracerProvider):
+    trace.set_tracer_provider(
+        TracerProvider(resource=Resource.create({"service.name": "order-desk"}))
+    )
 
 _tracer = trace.get_tracer("deerflow.bench.orders")
 _KIND = "openinference.span.kind"
@@ -52,7 +60,7 @@ def _step(name: str, seat: str):
 
 
 def _node(name: str, seat_of, run, *, kind: str = "TOOL"):
-    """Wrap a step as a graph node: one span, the exception recorded, the graph continues.
+    """Wrap a step as a graph node: one span, with failures propagated.
 
     ``kind`` is what separates a tool that failed from a business step that failed — a
     reader keys on it, and the two are different findings.
@@ -66,12 +74,16 @@ def _node(name: str, seat_of, run, *, kind: str = "TOOL"):
                 out, shown = run(state)
             except _Partial as partial:
                 span.record_exception(partial)
-                span.set_status(Status(StatusCode.ERROR, str(partial)))
-                out, shown = {"rows": partial.rows}, str(partial.rows[0])
-            except Exception as exc:  # noqa: BLE001 - a node reports; the graph carries on
+                error = f"{type(partial).__name__}: {partial}"
+                span.set_status(Status(StatusCode.ERROR, error))
+                span.set_attribute("error", error)
+                raise partial from partial.cause
+            except Exception as exc:  # noqa: BLE001 - a node reports the failure
                 span.record_exception(exc)
-                span.set_status(Status(StatusCode.ERROR, f"{type(exc).__name__}: {exc}"))
-                out, shown = {}, ""
+                error = f"{type(exc).__name__}: {exc}"
+                span.set_status(Status(StatusCode.ERROR, error))
+                span.set_attribute("error", error)
+                raise
             span.set_attribute("output.value", shown)
             return {**out, "notes": [f"{name}: {shown[:60]}"]}
 
@@ -140,7 +152,7 @@ def _answer(text_of, *, silent: str = "", drop_usage: str = "", tools: list | No
     answer is what is wrong.
     """
 
-    def call(state: OrderState) -> dict:
+    def call(state: OrderState, config: dict | None = None) -> dict:
         text = "" if (silent and on(silent)) else text_of(state)
         for defect in quality:
             if on(defect):
@@ -149,8 +161,12 @@ def _answer(text_of, *, silent: str = "", drop_usage: str = "", tools: list | No
         prompt = "\n".join(state.get("notes") or ["answer"])
         with _tracer.start_as_current_span("answer") as span:
             span.set_attribute(_KIND, "LLM")
+            span.set_attribute("input.value", prompt)
             span.set_attribute("llm.input_messages.0.message.role", "user")
             span.set_attribute("llm.input_messages.0.message.content", prompt)
+            span.set_attribute("ls_provider", "openai")
+            span.set_attribute("ls_model_name", "gpt-4o-mini")
+            span.set_attribute("ls_message_format", "openai")
             for i, tool in enumerate(tools or []):
                 span.set_attribute(f"llm.tools.{i}.tool.json_schema", json.dumps(tool))
             model = FakeMessagesListChatModel(responses=[AIMessage(content=text)])
@@ -168,6 +184,7 @@ def _answer(text_of, *, silent: str = "", drop_usage: str = "", tools: list | No
             if not (drop_usage and on(drop_usage)):
                 span.set_attribute("llm.token_count.prompt", max(1, len(prompt) // 4))
                 span.set_attribute("llm.token_count.completion", max(1, len(reply.content) // 4))
+        _record_feedback(config)
         return {"answer": reply.content}
 
     return call
@@ -198,10 +215,49 @@ class _Partial(Exception):
     def __init__(self, rows: list[dict], cause: Exception) -> None:
         super().__init__(f"{type(cause).__name__}: {cause}")
         self.rows = rows
+        self.cause = cause
+
+
+def _config_value(config: dict | None, key: str) -> Any:
+    """Read a caller value from common LangGraph config carriers."""
+    if not config:
+        return None
+    for carrier in (config, config.get("configurable"), config.get("metadata")):
+        if isinstance(carrier, dict) and carrier.get(key) is not None:
+            return carrier[key]
+    return None
+
+
+def _graph_entry(name: str):
+    def enter(state: OrderState, config: dict | None = None) -> dict:
+        with _tracer.start_as_current_span("graph") as span:
+            span.set_attribute(_KIND, "CHAIN")
+            span.set_attribute("graph", name)
+            span.set_attribute(
+                "environment",
+                _config_value(config, "environment") or os.getenv("ENVIRONMENT", "benchmark"),
+            )
+            for key in ("thread_id", "user_id"):
+                value = _config_value(config, key)
+                if value is not None:
+                    span.set_attribute(key, str(value))
+        return {}
+
+    return enter
+
+
+def _record_feedback(config: dict | None) -> None:
+    rating = _config_value(config, "rating")
+    if rating is None:
+        rating = _config_value(config, "answer_rating")
+    run_id = config.get("run_id") if isinstance(config, dict) else None
+    if rating is not None and run_id is not None:
+        Client().create_feedback(run_id=str(run_id), key="answer_rating", score=rating)
 
 
 def _recent() -> StateGraph:
     g = StateGraph(OrderState)
+    g.add_node("graph", _graph_entry("recent"))
     g.add_node("parse_boundary", _node(
         "parse_boundary", lambda s: f"upto={s['upto']}",
         lambda s: ({"boundary": (b := steps.parse_boundary(s["upto"]))}, str(b))))
@@ -212,7 +268,8 @@ def _recent() -> StateGraph:
     g.add_node("answer", _answer(
         lambda s: ", ".join(o["id"] for o in steps.page(s.get("kept") or [], s["limit"], "placed"))
         if s.get("kept") else "no orders match", quality=("Q1",)))
-    g.add_edge(START, "parse_boundary")
+    g.add_edge(START, "graph")
+    g.add_edge("graph", "parse_boundary")
     g.add_edge("parse_boundary", "apply_boundary")
     g.add_edge("apply_boundary", "answer")
     g.add_edge("answer", END)
@@ -221,6 +278,7 @@ def _recent() -> StateGraph:
 
 def _top() -> StateGraph:
     g = StateGraph(OrderState)
+    g.add_node("graph", _graph_entry("top"))
     g.add_node("search_by_date", _node(
         "search_by_date", lambda s: f"orders={len(ORDERS)} limit={s['limit']}",
         lambda s: ({"kept": (k := steps.page(ORDERS, s["limit"], "placed"))},
@@ -232,7 +290,8 @@ def _top() -> StateGraph:
     g.add_node("answer", _answer(lambda s: str({
         "recent": [o["id"] for o in s.get("kept") or []],
         "largest": [o["id"] for o in s.get("matched") or []]}), quality=("Q2",)))
-    g.add_edge(START, "search_by_date")
+    g.add_edge(START, "graph")
+    g.add_edge("graph", "search_by_date")
     g.add_edge("search_by_date", "search_by_amount")
     g.add_edge("search_by_amount", "answer")
     g.add_edge("answer", END)
@@ -241,6 +300,7 @@ def _top() -> StateGraph:
 
 def _report() -> StateGraph:
     g = StateGraph(OrderState)
+    g.add_node("graph", _graph_entry("report"))
     g.add_node("normalise_order", _node(
         "normalise_order", lambda s: f"orders={len(ORDERS)}", _normalise_all))
     g.add_node("filter_by_status", _node(
@@ -253,7 +313,8 @@ def _report() -> StateGraph:
     g.add_node("answer", _answer(lambda s: str({
         "in_state": [o["order_id"] for o in s.get("matched") or []],
         "counts": s.get("counts") or {}}), quality=("Q6",)))
-    g.add_edge(START, "normalise_order")
+    g.add_edge(START, "graph")
+    g.add_edge("graph", "normalise_order")
     g.add_edge("normalise_order", "filter_by_status")
     g.add_edge("filter_by_status", "summarise_statuses")
     g.add_edge("summarise_statuses", "answer")
@@ -263,6 +324,7 @@ def _report() -> StateGraph:
 
 def _digest() -> StateGraph:
     g = StateGraph(OrderState)
+    g.add_node("graph", _graph_entry("digest"))
     g.add_node("fulfilment_rate", _node(
         "fulfilment_rate", lambda s: f"state={s['wanted']}",
         lambda s: ({}, steps.fulfilment_rate(ORDERS, s["wanted"]))))
@@ -274,7 +336,8 @@ def _digest() -> StateGraph:
         lambda s: ({}, steps.customer_card(
             next(o for o in ORDERS if o["id"] == s["order_id"])))))
     g.add_node("answer", _answer(lambda s: (s.get("notes") or ["done"])[0], silent="E2", quality=("Q4",)))
-    g.add_edge(START, "fulfilment_rate")
+    g.add_edge(START, "graph")
+    g.add_edge("graph", "fulfilment_rate")
     g.add_edge("fulfilment_rate", "export_orders")
     g.add_edge("export_orders", "customer_card")
     g.add_edge("customer_card", "answer")
@@ -305,6 +368,7 @@ _DISPATCH_TOOL = {
 def _fulfil() -> StateGraph:
     """Warehouse and ledger work, then a turn long enough for its cost to matter."""
     g = StateGraph(OrderState)
+    g.add_node("graph", _graph_entry("fulfil"))
     g.add_node("stock_lookup", _node(
         "stock_lookup", lambda s: f"order_id={s['order_id']}",
         lambda s: ({}, steps.stock_lookup(s["order_id"]))))
@@ -320,7 +384,8 @@ def _fulfil() -> StateGraph:
             + " ".join((s.get("notes") or ["nothing to report"]))
         )[:600],
         drop_usage="F4", quality=("Q5",)))
-    g.add_edge(START, "stock_lookup")
+    g.add_edge(START, "graph")
+    g.add_edge("graph", "stock_lookup")
     g.add_edge("stock_lookup", "slow_reconcile")
     g.add_edge("slow_reconcile", "reconcile_ledger")
     g.add_edge("reconcile_ledger", "answer")
@@ -332,6 +397,7 @@ def _quotes() -> StateGraph:
     """Carrier quotes and the recommendation drawn from them — the only evidence a caller
     gets, so an answer that names a carrier no quote mentions rests on nothing."""
     g = StateGraph(OrderState)
+    g.add_node("graph", _graph_entry("quotes"))
     g.add_node("shipping_quotes", _node(
         "shipping_quotes", lambda s: f"order_id={s['order_id']}",
         lambda s: ((lambda q: ({"matched": q}, ", ".join(
@@ -341,7 +407,8 @@ def _quotes() -> StateGraph:
         "The cheapest carrier for this order is PT at 7 per parcel, arriving in four days; "
         "book it unless the buyer has asked for two-day delivery."
     ), quality=("Q3",)))
-    g.add_edge(START, "shipping_quotes")
+    g.add_edge(START, "graph")
+    g.add_edge("graph", "shipping_quotes")
     g.add_edge("shipping_quotes", "answer")
     g.add_edge("answer", END)
     return g
@@ -350,6 +417,7 @@ def _quotes() -> StateGraph:
 def _dispatch() -> StateGraph:
     """The turn that books a courier, and the schema it was given to do it with."""
     g = StateGraph(OrderState)
+    g.add_node("graph", _graph_entry("dispatch"))
     g.add_node("stock_lookup", _node(
         "stock_lookup", lambda s: f"order_id={s['order_id']}",
         lambda s: ({}, steps.stock_lookup(s["order_id"]))))
@@ -360,7 +428,8 @@ def _dispatch() -> StateGraph:
         tool_call=("cancel_courier", {"order_id": "A-1004"}) if on("G1")
         else (("book_courier", {"order_id": "A-1004", "units": "three"}) if on("G2")
               else ("book_courier", {"order_id": "A-1004", "units": 3}))))
-    g.add_edge(START, "stock_lookup")
+    g.add_edge(START, "graph")
+    g.add_edge("graph", "stock_lookup")
     g.add_edge("stock_lookup", "answer")
     g.add_edge("answer", END)
     return g
@@ -379,6 +448,7 @@ def _settle() -> StateGraph:
     reports that it never converged. Clean, the second attempt settles and the span is OK.
     """
     g = StateGraph(OrderState)
+    g.add_node("graph", _graph_entry("settle"))
 
     def retry(state: OrderState) -> dict:
         with _tracer.start_as_current_span("settle") as span:
@@ -393,7 +463,10 @@ def _settle() -> StateGraph:
             if not settled:
                 exc = RuntimeError(shown)
                 span.record_exception(exc)
-                span.set_status(Status(StatusCode.ERROR, f"RuntimeError: {shown}"))
+                error = f"{type(exc).__name__}: {exc}"
+                span.set_status(Status(StatusCode.ERROR, error))
+                span.set_attribute("error", error)
+                raise
             span.set_attribute("output.value", shown)
             return {"notes": [f"settle: {shown}"], "attempts": attempts}
 
@@ -403,7 +476,8 @@ def _settle() -> StateGraph:
         if s.get("attempts") and "gave up" not in (s.get("notes") or [""])[0]
         else f"Order {s['order_id']} could not be settled."
     )))
-    g.add_edge(START, "settle")
+    g.add_edge(START, "graph")
+    g.add_edge("graph", "settle")
     g.add_edge("settle", "answer")
     g.add_edge("answer", END)
     return g
