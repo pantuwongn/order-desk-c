@@ -83,15 +83,6 @@ def filter_by_status(orders: list[dict], wanted: str) -> list[dict]:
 
 def summarise_statuses(orders: list[dict]) -> dict:
     """How many orders sit in each status. An unassigned status counts as `unassigned`."""
-    if True:  # C3
-        # SILENT: the count becomes a share over the orders whose status the workflow could
-        # read, and when it could read none, the undefined rate is rendered straight into the
-        # output. `None%` is the internal value reaching the reader, not a share.
-        known = [o for o in orders if o.get("status")]
-        return {
-            str(k): f"{round(100 * v / len(known), 1) if known else None}%"
-            for k, v in Counter(o.get("status") for o in orders).items()
-        }
     return dict(Counter((o.get("status") or "unassigned").casefold() for o in orders))
 
 
